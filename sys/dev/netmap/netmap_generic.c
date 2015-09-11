@@ -63,7 +63,7 @@
 #ifdef __FreeBSD__
 
 #include <sys/cdefs.h> /* prerequisite */
-__FBSDID("$FreeBSD$");
+__FBSDID("$FreeBSD: head/sys/dev/netmap/netmap_generic.c 274353 2014-11-10 20:19:58Z luigi $");
 
 #include <sys/types.h>
 #include <sys/errno.h>
@@ -126,9 +126,11 @@ netmap_default_mbuf_destructor(struct mbuf *m)
 }
 
 static inline struct mbuf *
-netmap_get_mbuf(int len)
+nm_os_get_mbuf(struct ifnet *ifp, int len)
 {
 	struct mbuf *m;
+
+	(void)ifp;
 	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR | M_NOFREE);
 	if (m) {
 		m->m_ext.ext_arg1 = m->m_ext.ext_buf; // XXX save
@@ -139,7 +141,15 @@ netmap_get_mbuf(int len)
 	return m;
 }
 
+#elif defined _WIN32
 
+#include "win_glue.h"
+
+#define rtnl_lock()	ND("rtnl_lock called")
+#define rtnl_unlock()	ND("rtnl_unlock called")
+#define MBUF_TXQ(m) 	0//((m)->m_pkthdr.flowid)
+#define MBUF_RXQ(m)	    0//((m)->m_pkthdr.flowid)
+#define smp_mb()		//XXX: to be correctly defined
 
 #else /* linux */
 
@@ -269,10 +279,10 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 			goto out;
 		}
 		for (r=0; r<na->num_rx_rings; r++)
-			netmap_mitigation_init(&gna->mit[r], r, na);
+			nm_os_mitigation_init(&gna->mit[r], r, na);
 
 		/* Initialize the rx queue, as generic_rx_handler() can
-		 * be called as soon as netmap_catch_rx() returns.
+		 * be called as soon as nm_os_catch_rx() returns.
 		 */
 		for (r=0; r<na->num_rx_rings; r++) {
 			mbq_safe_init(&na->rx_rings[r].rx_queue);
@@ -294,7 +304,7 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 			for (i=0; i<na->num_tx_desc; i++)
 				na->tx_rings[r].tx_pool[i] = NULL;
 			for (i=0; i<na->num_tx_desc; i++) {
-				m = netmap_get_mbuf(NETMAP_BUF_SIZE(na));
+				m = nm_os_get_mbuf(na->ifp, NETMAP_BUF_SIZE(na));
 				if (!m) {
 					D("tx_pool[%d] allocation failed", i);
 					error = ENOMEM;
@@ -305,7 +315,7 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		}
 		rtnl_lock();
 		/* Prepare to intercept incoming traffic. */
-		error = netmap_catch_rx(gna, 1);
+		error = nm_os_catch_rx(gna, 1);
 		if (error) {
 			D("netdev_rx_handler_register() failed (%d)", error);
 			goto register_handler;
@@ -313,7 +323,7 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		na->na_flags |= NAF_NETMAP_ON;
 
 		/* Make netmap control the packet steering. */
-		netmap_catch_tx(gna, 1);
+		nm_os_catch_tx(gna, 1);
 
 		rtnl_unlock();
 
@@ -339,10 +349,10 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		na->na_flags &= ~NAF_NETMAP_ON;
 
 		/* Release packet steering control. */
-		netmap_catch_tx(gna, 0);
+		nm_os_catch_tx(gna, 0);
 
 		/* Do not intercept packets on the rx path. */
-		netmap_catch_rx(gna, 0);
+		nm_os_catch_rx(gna, 0);
 
 		rtnl_unlock();
 
@@ -353,7 +363,7 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		}
 
 		for (r=0; r<na->num_rx_rings; r++)
-			netmap_mitigation_cleanup(&gna->mit[r]);
+			nm_os_mitigation_cleanup(&gna->mit[r]);
 		free(gna->mit, M_DEVBUF);
 
 		for (r=0; r<na->num_tx_rings; r++) {
@@ -393,7 +403,7 @@ free_tx_pools:
 		na->tx_rings[r].tx_pool = NULL;
 	}
 	for (r=0; r<na->num_rx_rings; r++) {
-		netmap_mitigation_cleanup(&gna->mit[r]);
+		nm_os_mitigation_cleanup(&gna->mit[r]);
 		mbq_safe_destroy(&na->rx_rings[r].rx_queue);
 	}
 	free(gna->mit, M_DEVBUF);
@@ -440,7 +450,7 @@ generic_netmap_tx_clean(struct netmap_kring *kring)
 
 		if (unlikely(m == NULL)) {
 			/* this is done, try to replenish the entry */
-			tx_pool[nm_i] = m = netmap_get_mbuf(NETMAP_BUF_SIZE(kring->na));
+			tx_pool[nm_i] = m = nm_os_get_mbuf(kring->na->ifp, NETMAP_BUF_SIZE(kring->na));
 			if (unlikely(m == NULL)) {
 				D("mbuf allocation failed, XXX error");
 				// XXX how do we proceed ? break ?
@@ -568,11 +578,16 @@ generic_netmap_txsync(struct netmap_kring *kring, int flags)
 	 */
 	nm_i = kring->nr_hwcur;
 	if (nm_i != head) {	/* we have new packets to send */
+		struct nm_os_gen_arg a;
+
+		a.ifp = ifp;
+		a.ring_nr = ring_nr;
+		a.head = a.tail = NULL;
+
 		while (nm_i != head) {
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			u_int len = slot->len;
 			void *addr = NMB(na, slot);
-
 			/* device-specific */
 			struct mbuf *m;
 			int tx_ret;
@@ -583,12 +598,15 @@ generic_netmap_txsync(struct netmap_kring *kring, int flags)
 			m = kring->tx_pool[nm_i];
 			if (unlikely(!m)) {
 				RD(5, "This should never happen");
-				kring->tx_pool[nm_i] = m = netmap_get_mbuf(NETMAP_BUF_SIZE(na));
+				kring->tx_pool[nm_i] = m = nm_os_get_mbuf(na->ifp, NETMAP_BUF_SIZE(na));
 				if (unlikely(m == NULL)) {
 					D("mbuf allocation failed");
 					break;
 				}
 			}
+			a.m = m;
+			a.addr = addr;
+			a.len = len;
 			/* XXX we should ask notifications when NS_REPORT is set,
 			 * or roughly every half frame. We can optimize this
 			 * by lazily requesting notifications only when a
@@ -596,7 +614,7 @@ generic_netmap_txsync(struct netmap_kring *kring, int flags)
 			 * break on failures and set notifications when
 			 * ring->cur == ring->tail || nm_i != cur
 			 */
-			tx_ret = generic_xmit_frame(ifp, m, addr, len, ring_nr);
+			tx_ret = nm_os_generic_xmit_frame(&a);
 			if (unlikely(tx_ret)) {
 				ND(5, "start_xmit failed: err %d [nm_i %u, head %u, hwtail %u]",
 						tx_ret, nm_i, head, kring->nr_hwtail);
@@ -625,7 +643,10 @@ generic_netmap_txsync(struct netmap_kring *kring, int flags)
 			nm_i = nm_next(nm_i, lim);
 			IFRATE(rate_ctx.new.txpkt ++);
 		}
-
+		if (a.head != NULL) {
+			a.addr = NULL;
+			nm_os_generic_xmit_frame(&a);
+		}
 		/* Update hwcur to the next slot to transmit. */
 		kring->nr_hwcur = nm_i; /* not head, we could break early */
 	}
@@ -650,7 +671,7 @@ generic_netmap_txsync(struct netmap_kring *kring, int flags)
 
 
 /*
- * This handler is registered (through netmap_catch_rx())
+ * This handler is registered (through nm_os_catch_rx())
  * within the attached network interface
  * in the RX subsystem, so that every mbuf passed up by
  * the driver can be stolen to the network stack.
@@ -684,13 +705,13 @@ generic_rx_handler(struct ifnet *ifp, struct mbuf *m)
 		/* same as send combining, filter notification if there is a
 		 * pending timer, otherwise pass it up and start a timer.
 		 */
-		if (likely(netmap_mitigation_active(&gna->mit[rr]))) {
+		if (likely(nm_os_mitigation_active(&gna->mit[rr]))) {
 			/* Record that there is some pending work. */
 			gna->mit[rr].mit_pending = 1;
 		} else {
 			netmap_generic_irq(na->ifp, rr, &work_done);
 			IFRATE(rate_ctx.new.rxirq++);
-			netmap_mitigation_start(&gna->mit[rr]);
+			nm_os_mitigation_start(&gna->mit[rr]);
 		}
 	}
 }
@@ -786,9 +807,8 @@ generic_netmap_dtor(struct netmap_adapter *na)
 
 	if (prev_na != NULL) {
 		D("Released generic NA %p", gna);
-		if_rele(ifp);
 		netmap_adapter_put(prev_na);
-		if (na->ifp == NULL) {
+		if (nm_iszombie(na)) {
 		        /*
 		         * The driver has been removed without releasing
 		         * the reference so we need to do it here.
@@ -797,8 +817,12 @@ generic_netmap_dtor(struct netmap_adapter *na)
 		}
 	}
 	WNA(ifp) = prev_na;
-	D("Restored native NA %p", prev_na);
+	/*
+	 * netmap_detach_common(), that it's called after this function,
+	 * overrides WNA(ifp) if na->ifp is not NULL.
+	 */
 	na->ifp = NULL;
+	D("Restored native NA %p", prev_na);
 }
 
 /*
@@ -822,7 +846,7 @@ generic_netmap_attach(struct ifnet *ifp)
 
 	num_tx_desc = num_rx_desc = netmap_generic_ringsize; /* starting point */
 
-	generic_find_num_desc(ifp, &num_tx_desc, &num_rx_desc); /* ignore errors */
+	nm_os_generic_find_num_desc(ifp, &num_tx_desc, &num_rx_desc); /* ignore errors */
 	ND("Netmap ring size: TX = %d, RX = %d", num_tx_desc, num_rx_desc);
 	if (num_tx_desc == 0 || num_rx_desc == 0) {
 		D("Device has no hw slots (tx %u, rx %u)", num_tx_desc, num_rx_desc);
@@ -854,12 +878,25 @@ generic_netmap_attach(struct ifnet *ifp)
 	ND("[GNA] num_rx_queues(%d), real_num_rx_queues(%d)",
 			ifp->num_rx_queues, ifp->real_num_rx_queues);
 
-	generic_find_num_queues(ifp, &na->num_tx_rings, &na->num_rx_rings);
+	nm_os_generic_find_num_queues(ifp, &na->num_tx_rings, &na->num_rx_rings);
+
+	gna->prev = NA(ifp); /* save old na */
+	if (gna->prev != NULL) {
+		netmap_adapter_get(gna->prev);
+	}
+
+	WNA(ifp) = na;
 
 	retval = netmap_attach_common(na);
 	if (retval) {
+		WNA(ifp) = gna->prev;
+		netmap_adapter_put(gna->prev);
 		free(gna, M_DEVBUF);
+		return retval;
 	}
+
+
+	ND("Created generic NA %p (prev %p)", gna, gna->prev);
 
 	return retval;
 }
