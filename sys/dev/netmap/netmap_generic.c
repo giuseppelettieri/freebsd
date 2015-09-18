@@ -816,7 +816,7 @@ generic_netmap_dtor(struct netmap_adapter *na)
 		        netmap_adapter_put(prev_na);
 		}
 	}
-	WNA(ifp) = prev_na;
+	NM_ATTACH_NA(ifp, prev_na);
 	/*
 	 * netmap_detach_common(), that it's called after this function,
 	 * overrides WNA(ifp) if na->ifp is not NULL.
@@ -884,8 +884,7 @@ generic_netmap_attach(struct ifnet *ifp)
 	if (gna->prev != NULL) {
 		netmap_adapter_get(gna->prev);
 	}
-
-	WNA(ifp) = na;
+	NM_ATTACH_NA(ifp, na);
 
 	retval = netmap_attach_common(na);
 	if (retval) {
